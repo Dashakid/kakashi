@@ -77,6 +77,7 @@ RERANK_INTERVAL_SECONDS = 7 * 24 * 3600   # weekly wallet refresh flag
 
 DATA_API   = "https://data-api.polymarket.com"
 GAMMA_API  = "https://gamma-api.polymarket.com"
+CLOB_API   = "https://clob.polymarket.com"   # public read endpoints, no auth
 
 BOT_NAME = "Kakashi v2 (Basket)"
 
@@ -629,12 +630,46 @@ class BasketStrategy:
                 fetched_at=time.time(),
             )
 
-        # Try 1: direct condition id lookups — verify the returned market is
-        # actually the one we asked for (Gamma returns a generic listing when
-        # a query param is unknown/empty, and pricing a trade off a random
-        # market would be worse than skipping).
+        # Try 1: CLOB /markets/{condition_id} — the reliable by-id lookup.
         if not market_id:
             return None
+        clob_m = await self._fetch_clob_market(market_id)
+        if clob_m is not None:
+            if clob_m.get("closed"):
+                return None   # never open new trades in a closed market
+            clob_price: Optional[float] = None
+            clob_token_id = ""
+            want = outcome.strip().lower()
+            for tok in (clob_m.get("tokens") or []):
+                if not isinstance(tok, dict):
+                    continue
+                if want in str(tok.get("outcome", "")).strip().lower():
+                    clob_token_id = str(tok.get("token_id") or "")
+                    raw = tok.get("price")
+                    if raw is not None:
+                        try:
+                            clob_price = float(raw)
+                        except Exception:
+                            clob_price = None
+                    break
+            if clob_price is not None:
+                liquidity = await self._fetch_book_depth_usd(clob_token_id)
+                snap = MarketSnapshot(
+                    market_id=market_id,
+                    market_title=clob_m.get("question", "") or market_title,
+                    outcome=outcome,
+                    current_price=clob_price,
+                    volume_24h=0.0,
+                    open_interest=liquidity,
+                    fetched_at=time.time(),
+                )
+                self._market_cache[market_id] = snap
+                return snap
+
+        # Try 2: Gamma direct condition id lookups — verify the returned
+        # market is actually the one we asked for (Gamma returns a generic
+        # listing when a query param is unknown/empty, and pricing a trade
+        # off a random market would be worse than skipping).
         target = market_id.lower()
         for url in (
             f"{GAMMA_API}/markets?condition_ids={market_id}",
@@ -652,7 +687,7 @@ class BasketStrategy:
                     self._market_cache[market_id] = snap
                     return snap
 
-        # Try 2: keyword search fallback using the market's own title
+        # Try 3: keyword search fallback using the market's own title
         # (was previously hardcoded to "Bitcoin", which could never match
         #  sports/politics/finance markets).
         search_term = ""
@@ -685,6 +720,55 @@ class BasketStrategy:
         logger.warning(f"[strategy] snapshot-missing for {market_id[:20]} — all lookups failed")
         return None
 
+    async def _fetch_clob_market(self, market_id: str) -> Optional[dict]:
+        """
+        Fetch a market directly from the CLOB API by condition id:
+            GET https://clob.polymarket.com/markets/{condition_id}
+        Public, no auth. This is the canonical by-condition-id lookup —
+        Gamma's `condition_ids` query filter proved unreliable in live
+        verification (2026-07-01: 0/5 resolved markets found via Gamma).
+        Returns the market dict, or None if not found / id mismatch.
+        """
+        if not market_id:
+            return None
+        try:
+            async with self._http.get(f"{CLOB_API}/markets/{market_id}") as resp:
+                if resp.status != 200:
+                    return None
+                m = await resp.json()
+        except Exception:
+            return None
+        if not isinstance(m, dict):
+            return None
+        cid = str(m.get("condition_id") or m.get("conditionId") or "")
+        if cid.lower() != market_id.lower():
+            return None
+        return m
+
+    async def _fetch_book_depth_usd(self, token_id: str) -> float:
+        """
+        Rough $ liquidity from the CLOB order book (sum of price*size on
+        both sides). Returns 0.0 on any failure — the liquidity filter
+        then fails safe by rejecting the trade.
+        """
+        if not token_id:
+            return 0.0
+        try:
+            async with self._http.get(f"{CLOB_API}/book?token_id={token_id}") as resp:
+                if resp.status != 200:
+                    return 0.0
+                book = await resp.json()
+        except Exception:
+            return 0.0
+        depth = 0.0
+        for side in ("bids", "asks"):
+            for lvl in (book.get(side) or []):
+                try:
+                    depth += float(lvl.get("price", 0)) * float(lvl.get("size", 0))
+                except Exception:
+                    continue
+        return depth
+
     async def _check_market_resolved(
         self, market_id: str, outcome: str
     ) -> Tuple[bool, float]:
@@ -699,11 +783,33 @@ class BasketStrategy:
         outcomes / outcomePrices arrive as JSON-encoded STRINGS and must
         be decoded first.
         """
-        # An empty/None market_id would make the condition_ids param a no-op
-        # and Gamma would return a generic market list — never query with it.
         if not market_id:
             return False, 0.0
 
+        # ── Primary: CLOB /markets/{condition_id} — authoritative ────────
+        # Resolved markets carry tokens[].winner flags, which beat inferring
+        # the winner from price convergence.
+        clob_m = await self._fetch_clob_market(market_id)
+        if clob_m is not None:
+            tokens = clob_m.get("tokens") or []
+            if any(t.get("winner") for t in tokens if isinstance(t, dict)):
+                our_tok = None
+                want = outcome.strip().lower()
+                for t in tokens:
+                    if str(t.get("outcome", "")).strip().lower() == want:
+                        our_tok = t
+                        break
+                if our_tok is None:
+                    for t in tokens:
+                        if want in str(t.get("outcome", "")).strip().lower():
+                            our_tok = t
+                            break
+                if our_tok is not None:
+                    return True, (1.0 if our_tok.get("winner") else 0.0)
+            # Market found on CLOB but no winner flags yet → not resolved,
+            # unless Gamma (below) says otherwise.
+
+        # ── Fallback: Gamma condition_ids + outcomePrices convergence ────
         markets: List[dict] = []
         for url in (
             f"{GAMMA_API}/markets?condition_ids={market_id}",

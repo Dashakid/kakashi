@@ -358,3 +358,133 @@ class TestGammaMismatchGuard:
         ])
         resolved, price = asyncio.run(strat._check_market_resolved("0xabc", "No"))
         assert resolved is True and price == 1.0
+
+
+# ============================================================================
+# 7. CLOB primary lookup (fix for Gamma condition_ids being unreliable live)
+# ============================================================================
+
+class _RoutedHttp:
+    """Fake session routing CLOB vs Gamma vs Data API URLs."""
+    def __init__(self, clob=None, gamma=None, book=None, clob_status=200):
+        self._clob, self._gamma, self._book = clob, gamma or [], book or {}
+        self._clob_status = clob_status
+    def get(self, url):
+        if "clob.polymarket.com/markets/" in url:
+            return _FakeResp(self._clob_status, self._clob)
+        if "clob.polymarket.com/book" in url:
+            return _FakeResp(200, self._book)
+        return _FakeResp(200, self._gamma)
+
+
+class TestClobPrimaryLookup:
+    def test_resolution_via_clob_winner_flag_win(self, tmp_path, monkeypatch):
+        strat = _make_strategy(tmp_path, monkeypatch)
+        strat._http = _RoutedHttp(clob={
+            "condition_id": "0xabc",
+            "closed": True,
+            "tokens": [
+                {"token_id": "111", "outcome": "Yes", "winner": False},
+                {"token_id": "222", "outcome": "No", "winner": True},
+            ],
+        })
+        resolved, price = asyncio.run(strat._check_market_resolved("0xabc", "No"))
+        assert resolved is True and price == 1.0
+
+    def test_resolution_via_clob_winner_flag_loss(self, tmp_path, monkeypatch):
+        strat = _make_strategy(tmp_path, monkeypatch)
+        strat._http = _RoutedHttp(clob={
+            "condition_id": "0xabc",
+            "closed": True,
+            "tokens": [
+                {"token_id": "111", "outcome": "Yes", "winner": True},
+                {"token_id": "222", "outcome": "No", "winner": False},
+            ],
+        })
+        resolved, price = asyncio.run(strat._check_market_resolved("0xabc", "No"))
+        assert resolved is True and price == 0.0
+
+    def test_clob_id_mismatch_rejected(self, tmp_path, monkeypatch):
+        strat = _make_strategy(tmp_path, monkeypatch)
+        strat._http = _RoutedHttp(clob={
+            "condition_id": "0xDIFFERENT",
+            "closed": True,
+            "tokens": [{"token_id": "1", "outcome": "No", "winner": True}],
+        })
+        resolved, _ = asyncio.run(strat._check_market_resolved("0xabc", "No"))
+        assert resolved is False
+
+    def test_no_winner_flags_falls_back_to_gamma(self, tmp_path, monkeypatch):
+        strat = _make_strategy(tmp_path, monkeypatch)
+        strat._http = _RoutedHttp(
+            clob={
+                "condition_id": "0xabc",
+                "closed": True,
+                "tokens": [
+                    {"token_id": "111", "outcome": "Yes", "winner": False},
+                    {"token_id": "222", "outcome": "No", "winner": False},
+                ],
+            },
+            gamma=[{
+                "conditionId": "0xabc",
+                "closed": True,
+                "outcomes": '["Yes", "No"]',
+                "outcomePrices": '["0", "1"]',
+            }],
+        )
+        resolved, price = asyncio.run(strat._check_market_resolved("0xabc", "No"))
+        assert resolved is True and price == 1.0
+
+    def test_snapshot_via_clob_with_book_liquidity(self, tmp_path, monkeypatch):
+        strat = _make_strategy(tmp_path, monkeypatch)
+        strat._http = _RoutedHttp(
+            clob={
+                "condition_id": "0xabc",
+                "question": "Test market",
+                "closed": False,
+                "tokens": [
+                    {"token_id": "111", "outcome": "Yes", "price": "0.62"},
+                    {"token_id": "222", "outcome": "No", "price": "0.38"},
+                ],
+            },
+            book={
+                "bids": [{"price": "0.37", "size": "10000"}],
+                "asks": [{"price": "0.39", "size": "20000"}],
+            },
+        )
+        snap = asyncio.run(
+            strat._fetch_market_snapshot("0xabc", "No", 0.38, market_title="Test")
+        )
+        assert snap is not None
+        assert abs(snap.current_price - 0.38) < 1e-9
+        assert snap.open_interest > 10_000   # 0.37*10k + 0.39*20k ≈ 11.5k
+
+    def test_snapshot_refuses_closed_clob_market(self, tmp_path, monkeypatch):
+        strat = _make_strategy(tmp_path, monkeypatch)
+        strat._http = _RoutedHttp(clob={
+            "condition_id": "0xabc",
+            "question": "Done market",
+            "closed": True,
+            "tokens": [{"token_id": "1", "outcome": "No", "price": "1.0"}],
+        })
+        snap = asyncio.run(
+            strat._fetch_market_snapshot("0xabc", "No", 0.5, market_title="Done")
+        )
+        assert snap is None
+
+    def test_clob_404_falls_back_to_gamma(self, tmp_path, monkeypatch):
+        strat = _make_strategy(tmp_path, monkeypatch)
+        strat._http = _RoutedHttp(
+            clob=None, clob_status=404,
+            gamma=[{
+                "conditionId": "0xabc",
+                "question": "Gamma market",
+                "outcomes": '["Yes", "No"]',
+                "outcomePrices": '["0.6", "0.4"]',
+                "liquidity": "50000",
+            }],
+        )
+        snap = asyncio.run(
+            strat._fetch_market_snapshot("0xabc", "No", 0.4, market_title="Gamma market")
+        )
+        assert snap is not None and abs(snap.current_price - 0.4) < 1e-9
