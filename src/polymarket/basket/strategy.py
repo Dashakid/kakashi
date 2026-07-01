@@ -10,7 +10,7 @@ Every POLL_INTERVAL_SECONDS:
      tracked wallet via the Polymarket data API.
   2. Build a "consensus map": for each (market, outcome) pair, count how
      many wallets in the basket hold that position.
-  3. If consensus_count / basket_size >= CONSENSUS_THRESHOLD (80%):
+  3. If consensus_count / basket_size >= CONSENSUS_THRESHOLD (50%):
        a. Run market filters (liquidity + slippage).
        b. If we don't already have an open paper trade for this signal,
           size the trade at MAX_POSITION_PCT (5%) of account balance,
@@ -61,6 +61,17 @@ PAPER_BALANCE_USD    = 1_000.0  # starting paper balance for sizing
 MIN_BASKET_SIZE      = 2        # require at least 2 wallets per basket
 MAX_OPEN_PER_BASKET  = 3        # max concurrent open paper trades per basket
 
+# Total open notional may never exceed the paper balance.
+MAX_TOTAL_EXPOSURE_USD = PAPER_BALANCE_USD
+
+# Close a paper trade if the wallets that formed the consensus have exited
+# (copy exits, not just entries). Grace period avoids closing on a single
+# missed/flaky API poll.
+CLOSE_ON_CONSENSUS_EXIT   = True
+CONSENSUS_EXIT_GRACE_SECS = 3 * 60   # signal must be absent for 3 minutes
+
+SNAPSHOT_CACHE_TTL_SECS = 60    # market snapshots go stale after one poll cycle
+
 POLL_INTERVAL_SECONDS   = 60    # check positions every 60 s
 RERANK_INTERVAL_SECONDS = 7 * 24 * 3600   # weekly wallet refresh flag
 
@@ -88,7 +99,7 @@ class WalletPosition:
 
 @dataclass
 class ConsensusSignal:
-    """A basket-level signal that has passed the 80% threshold."""
+    """A basket-level signal that has passed the consensus threshold."""
     basket: str
     market_id: str
     market_title: str
@@ -116,6 +127,12 @@ class BasketStrategy:
         self._last_rerank_ts: float = 0.0
         self._session_signals: int = 0
         self._market_cache: Dict[str, MarketSnapshot] = {}
+        # (basket, market_id, outcome) keys that still have consensus this tick
+        self._live_consensus_keys: set = set()
+        # trade_id → first timestamp its consensus went missing (grace timer)
+        self._consensus_missing_since: Dict[str, float] = {}
+        # signal keys already logged, to stop repeating CONSENSUS every 60s
+        self._logged_signal_keys: set = set()
 
     # ------------------------------------------------------------------
     # Main loop
@@ -136,7 +153,7 @@ class BasketStrategy:
                 await BotAlert.startup(
                     bot_name=BOT_NAME,
                     strategy=(
-                        "Basket consensus: 80%+ wallet agreement | "
+                        "Basket consensus: 50%+ wallet agreement | "
                         "paper-only | 5% max per trade"
                     ),
                     mode="PAPER",
@@ -163,6 +180,7 @@ class BasketStrategy:
 
     async def _tick(self) -> None:
         now = time.time()
+        self._live_consensus_keys = set()
 
         # Weekly refresh flag
         if now - self._last_rerank_ts > RERANK_INTERVAL_SECONDS:
@@ -246,6 +264,9 @@ class BasketStrategy:
             if consensus_pct < CONSENSUS_THRESHOLD:
                 continue
 
+            key = (basket_name, market_id, outcome)
+            self._live_consensus_keys.add(key)
+
             avg_price = (
                 sum(data["prices"]) / len(data["prices"]) if data["prices"] else 0.5
             )
@@ -261,12 +282,15 @@ class BasketStrategy:
                     consensus_pct=consensus_pct,
                 )
             )
-            logger.info(
-                f"[strategy] CONSENSUS {basket_name}/{outcome} "
-                f"{data['title'][:40]} | "
-                f"{len(unique_wallets)}/{basket_size} wallets "
-                f"({consensus_pct*100:.0f}%)"
-            )
+            # Log each distinct signal once, not every 60 s forever.
+            if key not in self._logged_signal_keys:
+                self._logged_signal_keys.add(key)
+                logger.info(
+                    f"[strategy] CONSENSUS {basket_name}/{outcome} "
+                    f"{data['title'][:40]} | "
+                    f"{len(unique_wallets)}/{basket_size} wallets "
+                    f"({consensus_pct*100:.0f}%)"
+                )
 
         return signals
 
@@ -276,7 +300,7 @@ class BasketStrategy:
 
     async def _handle_signal(self, signal: ConsensusSignal) -> None:
         """Validate filters, check dedup, then open a paper trade."""
-        logger.info(
+        logger.debug(
             f"[strategy] HANDLE {signal.basket}/{signal.outcome} "
             f"market_id={signal.market_id[:12]}... "
             f"consensus={signal.consensus_pct*100:.0f}%"
@@ -299,9 +323,22 @@ class BasketStrategy:
             )
             return
 
+        # Global exposure cap: never exceed the paper balance across ALL baskets.
+        size_usd = min(PAPER_BALANCE_USD * MAX_POSITION_PCT, PAPER_TRADE_MAX_USD)
+        total_open_notional = sum(
+            t.paper_size_usd for t in self._tracker._state.open_trades.values()
+        )
+        if total_open_notional + size_usd > MAX_TOTAL_EXPOSURE_USD:
+            logger.info(
+                f"[strategy] SKIP exposure-cap: open ${total_open_notional:,.0f} "
+                f"+ ${size_usd:,.0f} > ${MAX_TOTAL_EXPOSURE_USD:,.0f}"
+            )
+            return
+
         # Fetch current market snapshot for filters
         snapshot = await self._fetch_market_snapshot(
-            signal.market_id, signal.outcome, signal.consensus_price
+            signal.market_id, signal.outcome, signal.consensus_price,
+            market_title=signal.market_title,
         )
         if snapshot is None:
             logger.info(
@@ -317,9 +354,7 @@ class BasketStrategy:
             )
             return
 
-        # Size: 5% of paper balance, capped at PAPER_TRADE_MAX_USD
-        size_usd = min(PAPER_BALANCE_USD * MAX_POSITION_PCT, PAPER_TRADE_MAX_USD)
-
+        # Size was computed above (5% of paper balance, capped at PAPER_TRADE_MAX_USD)
         trade_id = self._tracker.open_trade(
             basket=signal.basket,
             market_id=signal.market_id,
@@ -343,37 +378,75 @@ class BasketStrategy:
 
     async def _check_open_positions(self) -> None:
         """
-        For every open paper trade, check if the market has resolved.
-        If resolved, close the trade at the final price (1.0 for YES win, 0.0 for loss).
+        For every open paper trade:
+          1. Close at final price if the market has resolved.
+          2. (Copy exits) Close at current market price if the wallets that
+             formed the consensus have exited the position — a copy-trading
+             strategy that only copies entries but never exits gives back
+             the edge the tracked wallets capture by exiting early.
         """
+        now = time.time()
         open_trades = list(self._tracker._state.open_trades.values())
         for trade in open_trades:
             try:
+                # --- 1. Resolution close -------------------------------
                 resolved, final_price = await self._check_market_resolved(
                     trade.market_id, trade.outcome
                 )
                 if resolved:
-                    closed = self._tracker.close_trade(
-                        trade.trade_id,
-                        exit_price=final_price,
-                        reason="resolved",
-                    )
-                    if closed is not None:
-                        from src.tracking.trade_logger import log_trade
-                        log_trade(
-                            bot="v2",
-                            market=getattr(trade, "market_title", trade.market_id),
-                            outcome=trade.outcome,
-                            entry_price=closed.entry_price,
-                            exit_price=closed.exit_price,
-                            size_usd=closed.paper_size_usd,
-                            is_win=closed.is_win,
-                            resolved_via="gamma_api",
-                        )
+                    self._close_and_log(trade, final_price, "resolved")
+                    self._consensus_missing_since.pop(trade.trade_id, None)
+                    continue
+
+                # --- 2. Consensus-exit close ---------------------------
+                if not CLOSE_ON_CONSENSUS_EXIT:
+                    continue
+
+                key = (trade.basket, trade.market_id, trade.outcome)
+                if key in self._live_consensus_keys:
+                    self._consensus_missing_since.pop(trade.trade_id, None)
+                    continue
+
+                first_missing = self._consensus_missing_since.setdefault(
+                    trade.trade_id, now
+                )
+                if now - first_missing < CONSENSUS_EXIT_GRACE_SECS:
+                    continue  # grace period — could be one flaky API poll
+
+                snapshot = await self._fetch_market_snapshot(
+                    trade.market_id, trade.outcome, trade.entry_price,
+                    market_title=getattr(trade, "market_title", ""),
+                )
+                if snapshot is None:
+                    continue  # can't verify a live exit price — hold
+
+                self._close_and_log(trade, snapshot.current_price, "consensus_exit")
+                self._consensus_missing_since.pop(trade.trade_id, None)
+
             except Exception as exc:
                 logger.debug(
                     f"[strategy] resolution check failed for {trade.trade_id}: {exc}"
                 )
+
+    def _close_and_log(self, trade, exit_price: float, reason: str) -> None:
+        """Close a trade in the tracker and write it to the trade log."""
+        closed = self._tracker.close_trade(
+            trade.trade_id,
+            exit_price=exit_price,
+            reason=reason,
+        )
+        if closed is not None:
+            from src.tracking.trade_logger import log_trade
+            log_trade(
+                bot="v2",
+                market=getattr(trade, "market_title", trade.market_id),
+                outcome=trade.outcome,
+                entry_price=closed.entry_price,
+                exit_price=closed.exit_price,
+                size_usd=closed.paper_size_usd,
+                is_win=closed.is_win,
+                resolved_via="gamma_api" if reason == "resolved" else reason,
+            )
 
     # ------------------------------------------------------------------
     # API helpers
@@ -424,16 +497,18 @@ class BasketStrategy:
         market_id: str,
         outcome: str,
         consensus_price: float,
+        market_title: str = "",
     ) -> Optional[MarketSnapshot]:
         """
         Fetch current price and open-interest for a market.
-        Returns None on error.
+        Returns None on error OR if no live price could be extracted —
+        we never trade on a price we couldn't verify.
         """
-        logger.info(f"[strategy] snapshot lookup market_id={market_id}")
+        logger.debug(f"[strategy] snapshot lookup market_id={market_id}")
 
-        # Try 0: local cache
+        # Try 0: local cache (with TTL — stale prices break the slippage filter)
         cached = self._market_cache.get(market_id)
-        if cached is not None:
+        if cached is not None and (time.time() - cached.fetched_at) < SNAPSHOT_CACHE_TTL_SECS:
             return cached
 
         async def _get_markets(url: str) -> List[dict]:
@@ -492,7 +567,7 @@ class BasketStrategy:
                 return []
 
             try:
-                current_price = consensus_price  # fallback
+                current_price: Optional[float] = None  # None = no live price found
 
                 # Shape A: tokens is a list of dicts with outcome/price.
                 token_rows = m.get("tokens", [])
@@ -502,22 +577,34 @@ class BasketStrategy:
                             continue
                         tok_outcome = str(tok.get("outcome") or tok.get("name") or "").lower()
                         if outcome.lower() in tok_outcome:
-                            current_price = _safe_float(
-                                tok.get("price") or tok.get("lastTradePrice"),
-                                consensus_price,
-                            )
+                            price = tok.get("price") or tok.get("lastTradePrice")
+                            if price is not None:
+                                current_price = _safe_float(price, -1.0)
+                                if current_price < 0:
+                                    current_price = None
                             break
 
                 # Shape B: outcomes/outcomePrices are JSON-encoded strings.
-                if current_price == consensus_price:
+                if current_price is None:
                     outcomes = _as_list(m.get("outcomes"))
                     outcome_prices = _as_list(m.get("outcomePrices"))
                     for idx, out_name in enumerate(outcomes):
                         if outcome.lower() not in str(out_name).lower():
                             continue
                         if idx < len(outcome_prices):
-                            current_price = _safe_float(outcome_prices[idx], consensus_price)
+                            parsed = _safe_float(outcome_prices[idx], -1.0)
+                            if parsed >= 0:
+                                current_price = parsed
                         break
+
+                # No verifiable live price → do not fabricate one. Trading on
+                # consensus_price here would silently disable the slippage
+                # filter (drift would always be 0%).
+                if current_price is None:
+                    logger.debug(
+                        f"[strategy] no live price extractable for {market_id[:20]} — skipping"
+                    )
+                    return None
 
                 event_list = m.get("events", [])
                 event_open_interest = 0.0
@@ -555,10 +642,20 @@ class BasketStrategy:
                     self._market_cache[market_id] = snap
                     return snap
 
-        # Try 2: keyword search fallback and match conditionId/token id
-        search_markets = await _get_markets(
-            f"{GAMMA_API}/markets?search=Bitcoin&active=true&limit=100"
-        )
+        # Try 2: keyword search fallback using the market's own title
+        # (was previously hardcoded to "Bitcoin", which could never match
+        #  sports/politics/finance markets).
+        search_term = ""
+        for word in market_title.split():
+            cleaned = "".join(ch for ch in word if ch.isalnum())
+            if len(cleaned) >= 4:
+                search_term = cleaned
+                break
+        search_markets = []
+        if search_term:
+            search_markets = await _get_markets(
+                f"{GAMMA_API}/markets?search={search_term}&active=true&limit=100"
+            )
         if search_markets:
             target = market_id.lower()
             match = next(
@@ -584,6 +681,13 @@ class BasketStrategy:
         """
         Returns (is_resolved, final_price).
         final_price = 1.0 if our outcome won, 0.0 if lost.
+
+        NOTE: The Gamma /markets schema has NO `winnerOutcome` or
+        `resolutionOutcome` field. Resolution must be derived from:
+          - closed == true  (market resolved), plus
+          - outcomePrices, which converge to ~["1","0"] on resolution.
+        outcomes / outcomePrices arrive as JSON-encoded STRINGS and must
+        be decoded first.
         """
         markets: List[dict] = []
         for url in (
@@ -607,17 +711,55 @@ class BasketStrategy:
             return False, 0.0
 
         m = markets[0]
-        closed = m.get("closed") or m.get("resolved") or False
+
+        uma_status = str(m.get("umaResolutionStatus") or "").lower()
+        closed = bool(m.get("closed")) or uma_status == "resolved"
         if not closed:
             return False, 0.0
 
-        # Determine winning outcome
-        winner = (m.get("winnerOutcome") or m.get("resolutionOutcome") or "").lower()
-        if not winner:
+        def _decode_list(value: object) -> List[str]:
+            if isinstance(value, list):
+                return [str(v) for v in value]
+            if isinstance(value, str) and value.strip():
+                try:
+                    parsed = json.loads(value)
+                    return [str(v) for v in parsed] if isinstance(parsed, list) else []
+                except Exception:
+                    return []
+            return []
+
+        outcomes = _decode_list(m.get("outcomes"))
+        prices = _decode_list(m.get("outcomePrices"))
+        if not outcomes or len(outcomes) != len(prices):
             return False, 0.0
 
-        final_price = 1.0 if outcome.lower() in winner else 0.0
-        return True, final_price
+        # Find OUR outcome's index by exact (case-insensitive) match first,
+        # substring only as fallback — avoids "No" matching inside other words.
+        our_idx = -1
+        for idx, name in enumerate(outcomes):
+            if name.strip().lower() == outcome.strip().lower():
+                our_idx = idx
+                break
+        if our_idx < 0:
+            for idx, name in enumerate(outcomes):
+                if outcome.strip().lower() in name.strip().lower():
+                    our_idx = idx
+                    break
+        if our_idx < 0:
+            return False, 0.0
+
+        try:
+            our_price = float(prices[our_idx])
+        except Exception:
+            return False, 0.0
+
+        # A resolved market's prices converge to ~1 / ~0. Require a decisive
+        # value; anything in between means resolution data isn't final yet.
+        if our_price >= 0.95:
+            return True, 1.0
+        if our_price <= 0.05:
+            return True, 0.0
+        return False, 0.0
 
     # ------------------------------------------------------------------
     # Weekly wallet refresh flag

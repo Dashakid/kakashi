@@ -21,7 +21,7 @@ from loguru import logger
 
 from src.polymarket.client import PolymarketClient, OrderBook
 from src.polymarket.market_discovery import MarketDiscovery, DiscoveredMarket
-from src.polymarket import live_rulesfrom src.notifications.alerts import BotAlert
+from src.notifications.alerts import BotAlert
 from src.polymarket import live_rules
 
 

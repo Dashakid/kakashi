@@ -21,6 +21,23 @@ from src.polymarket.basket.wallets import MIN_LIQUIDITY_USD
 # Maximum price drift from consensus price before we skip the trade.
 MAX_PRICE_DRIFT_PCT = 0.03   # 3%
 
+# Entry price band — outside this band the risk/reward is structurally bad:
+#   price 0.97 → risk $97 to win $3 (a near-resolved market)
+#   price 0.02 → longshot lottery ticket; consensus here is usually stale
+MIN_ENTRY_PRICE = 0.05
+MAX_ENTRY_PRICE = 0.92
+
+
+def check_price_band(snapshot: MarketSnapshot) -> tuple[bool, str]:
+    """Reject entries whose price is too close to 0 or 1."""
+    p = snapshot.current_price
+    if p < MIN_ENTRY_PRICE or p > MAX_ENTRY_PRICE:
+        return False, (
+            f"price {p:.3f} outside entry band "
+            f"[{MIN_ENTRY_PRICE:.2f}, {MAX_ENTRY_PRICE:.2f}]"
+        )
+    return True, ""
+
 
 # ---------------------------------------------------------------------------
 # Data classes
@@ -113,6 +130,20 @@ def run_filters(
         return FilterResult(
             passed=False,
             reason=liq_reason,
+            consensus_price=consensus_price,
+            current_price=snapshot.current_price,
+            liquidity=liquidity,
+            drift_pct=drift,
+        )
+
+    band_ok, band_reason = check_price_band(snapshot)
+    if not band_ok:
+        logger.debug(
+            f"[filter] SKIP {snapshot.market_title[:40]} | {band_reason}"
+        )
+        return FilterResult(
+            passed=False,
+            reason=band_reason,
             consensus_price=consensus_price,
             current_price=snapshot.current_price,
             liquidity=liquidity,

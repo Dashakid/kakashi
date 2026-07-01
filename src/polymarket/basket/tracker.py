@@ -15,6 +15,7 @@ Responsibilities
 from __future__ import annotations
 
 import json
+import os
 import time
 from dataclasses import dataclass, field, asdict
 from datetime import datetime, timezone, timedelta
@@ -133,7 +134,16 @@ class BasketTracker:
                 f"{len(self._state.closed_trades)} closed trades"
             )
         except Exception as exc:
-            logger.warning(f"[tracker] Failed to load state ({exc}) — starting fresh")
+            # Do NOT silently wipe history — back up the corrupt file first
+            # so P&L records can be recovered manually.
+            backup = STATE_FILE.with_suffix(f".corrupt.{int(time.time())}.json")
+            try:
+                os.replace(STATE_FILE, backup)
+                logger.error(
+                    f"[tracker] State file corrupt ({exc}) — backed up to {backup}, starting fresh"
+                )
+            except Exception:
+                logger.error(f"[tracker] Failed to load state ({exc}) — starting fresh")
 
     def _save(self) -> None:
         self._state.last_saved_ts = time.time()
@@ -148,7 +158,11 @@ class BasketTracker:
                 },
                 "last_saved_ts": self._state.last_saved_ts,
             }
-            STATE_FILE.write_text(json.dumps(payload, indent=2))
+            # Atomic write: dump to temp file then rename, so a crash
+            # mid-write can never leave a truncated/corrupt state file.
+            tmp_file = STATE_FILE.with_suffix(".json.tmp")
+            tmp_file.write_text(json.dumps(payload, indent=2))
+            os.replace(tmp_file, STATE_FILE)
         except Exception as exc:
             logger.error(f"[tracker] Failed to save state: {exc}")
 
