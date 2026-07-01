@@ -474,9 +474,22 @@ class BasketStrategy:
         results = []
         for item in data if isinstance(data, list) else data.get("data", []):
             try:
-                # Normalise outcome to "Yes" / "No"
-                raw_outcome = item.get("outcome") or item.get("side", "Yes")
-                outcome = "Yes" if str(raw_outcome).lower() in ("yes", "1", "long") else "No"
+                # Preserve the REAL outcome name. Polymarket outcomes are not
+                # always Yes/No — sports markets use "Over"/"Under", team
+                # names, spreads, etc. The old normalisation collapsed every
+                # non-Yes outcome to "No", which (a) merged OPPOSITE positions
+                # ("Over" + "Under") into one fake consensus bucket, and
+                # (b) made those markets unmatchable at snapshot/resolution.
+                raw_outcome = str(item.get("outcome") or item.get("side") or "").strip()
+                low = raw_outcome.lower()
+                if low in ("1", "long"):
+                    outcome = "Yes"
+                elif low in ("0", "short"):
+                    outcome = "No"
+                elif raw_outcome:
+                    outcome = raw_outcome          # keep as-is: Over, England, ...
+                else:
+                    continue                        # no outcome info → unusable
 
                 results.append(
                     WalletPosition(

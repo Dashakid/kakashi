@@ -488,3 +488,63 @@ class TestClobPrimaryLookup:
             strat._fetch_market_snapshot("0xabc", "No", 0.4, market_title="Gamma market")
         )
         assert snap is not None and abs(snap.current_price - 0.4) < 1e-9
+
+
+# ============================================================================
+# 8. Outcome preservation (false-consensus bug, found via live verification)
+# ============================================================================
+
+class TestOutcomePreservation:
+    def _positions_payload(self):
+        return [
+            {"conditionId": "0xou", "title": "O/U 2.5", "outcome": "Over",
+             "currentValue": 500, "avgPrice": 0.5, "asset": "t1"},
+        ]
+
+    def test_real_outcome_names_preserved(self, tmp_path, monkeypatch):
+        strat = _make_strategy(tmp_path, monkeypatch)
+        strat._http = _FakeHttp(self._positions_payload())
+        positions = asyncio.run(strat._fetch_wallet_positions("0xw1", "whale"))
+        assert positions[0].outcome == "Over"   # NOT collapsed to "No"
+
+    def test_opposite_positions_do_not_form_consensus(self, tmp_path, monkeypatch):
+        """Two whales on OPPOSITE sides of an O/U market must not count as
+        agreeing. Old code mapped both Over and Under to 'No' → fake 2-wallet
+        consensus."""
+        from src.polymarket.basket.strategy import WalletPosition
+        strat = _make_strategy(tmp_path, monkeypatch)
+        positions = [
+            WalletPosition(wallet="0xw1", market_id="0xou", market_title="O/U 2.5",
+                           outcome="Over", size_usd=500, avg_price=0.5),
+            WalletPosition(wallet="0xw2", market_id="0xou", market_title="O/U 2.5",
+                           outcome="Under", size_usd=500, avg_price=0.5),
+        ]
+        signals = strat._find_consensus("sports", positions, basket_size=4)
+        assert signals == []   # 1/4 each side — no consensus on either
+
+    def test_same_side_positions_do_form_consensus(self, tmp_path, monkeypatch):
+        from src.polymarket.basket.strategy import WalletPosition
+        strat = _make_strategy(tmp_path, monkeypatch)
+        positions = [
+            WalletPosition(wallet="0xw1", market_id="0xou", market_title="O/U 2.5",
+                           outcome="Over", size_usd=500, avg_price=0.5),
+            WalletPosition(wallet="0xw2", market_id="0xou", market_title="O/U 2.5",
+                           outcome="Over", size_usd=500, avg_price=0.5),
+        ]
+        signals = strat._find_consensus("sports", positions, basket_size=4)
+        assert len(signals) == 1 and signals[0].outcome == "Over"
+
+    def test_resolution_matches_named_outcome(self, tmp_path, monkeypatch):
+        strat = _make_strategy(tmp_path, monkeypatch)
+        strat._http = _RoutedHttp(clob={
+            "condition_id": "0xteam",
+            "closed": True,
+            "tokens": [
+                {"token_id": "1", "outcome": "England", "winner": True},
+                {"token_id": "2", "outcome": "DR Congo", "winner": False},
+            ],
+        })
+        resolved, price = asyncio.run(
+            strat._check_market_resolved("0xteam", "England")
+        )
+        assert resolved is True and price == 1.0

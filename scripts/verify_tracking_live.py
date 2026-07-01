@@ -43,10 +43,10 @@ async def main() -> int:
 
         # ── 1. Wallet positions ────────────────────────────────────────
         print("\n[1] Data API — tracked wallet positions")
-        sample_market = None
+        sample_positions = []
         for basket, entries in BASKETS.items():
             for address, label in entries:
-                url = f"{DATA_API}/positions?user={address}&sizeThreshold=10"
+                url = f"{DATA_API}/positions?user={address}&sizeThreshold=10&limit=500"
                 try:
                     async with http.get(url) as resp:
                         data = await resp.json() if resp.status == 200 else None
@@ -55,27 +55,39 @@ async def main() -> int:
                         continue
                     positions = data if isinstance(data, list) else data.get("data", [])
                     report(f"{basket}/{label}", True, f"{len(positions)} open positions")
-                    if positions and sample_market is None:
-                        sample_market = positions[0].get("conditionId")
+                    sample_positions.extend(positions[:2])
                 except Exception as exc:
                     report(f"{basket}/{label}", False, str(exc)[:60])
 
-        # ── 2. Snapshot parsing on a live market ───────────────────────
-        print("\n[2] Gamma API — snapshot price extraction")
+        # ── 2. Snapshot parsing on live markets (real outcomes) ────────
+        print("\n[2] CLOB/Gamma — snapshot price extraction")
         strat = BasketStrategy()
         strat._http = http
-        if sample_market:
+        snap_ok = False
+        tried = 0
+        for p in sample_positions[:8]:
+            cid = str(p.get("conditionId") or "")
+            raw_outcome = str(p.get("outcome") or "").strip()
+            title = p.get("title", "")
+            if not cid or not raw_outcome:
+                continue
+            tried += 1
             snap = await strat._fetch_market_snapshot(
-                sample_market, "Yes", 0.5, market_title=""
+                cid, raw_outcome, float(p.get("avgPrice") or 0.5),
+                market_title=title,
             )
-            report(
-                "live snapshot parsed",
-                snap is not None,
-                f"price={snap.current_price:.3f} liq=${snap.open_interest:,.0f}"
-                if snap else "no price extracted (check market fields)",
-            )
-        else:
-            report("live snapshot parsed", False, "no wallet had open positions to test with")
+            if snap is not None:
+                snap_ok = True
+                report("live snapshot parsed", True,
+                       f"'{title[:40]}' [{raw_outcome}] price={snap.current_price:.3f} "
+                       f"book_depth=${snap.open_interest:,.0f}")
+                break
+            else:
+                print(f"  ·  '{title[:40]}' [{raw_outcome}] → no snapshot "
+                      f"(closed market or no live price — trying next)")
+        if not snap_ok:
+            report("live snapshot parsed", False,
+                   f"none of {tried} sampled positions yielded a snapshot")
 
         # ── 3. Resolution parsing on real resolved markets ─────────────
         print("\n[3] Gamma API — resolution detection on real closed markets")
@@ -92,22 +104,26 @@ async def main() -> int:
                     print(f"  ⚠️  '{q}' has EMPTY conditionId — skipped "
                           f"(bot now guards against this)")
                     continue
+                # Use the market's REAL first outcome (Yes / Over / England / ...)
+                raw_outs = m.get("outcomes")
+                try:
+                    outs = json.loads(raw_outs) if isinstance(raw_outs, str) else (raw_outs or [])
+                except Exception:
+                    outs = []
+                probe_outcome = str(outs[0]) if outs else "Yes"
                 tested += 1
-                resolved, price = await strat._check_market_resolved(cid, "Yes")
+                resolved, price = await strat._check_market_resolved(cid, probe_outcome)
                 if resolved:
                     passed_any += 1
-                    print(f"  ✅ '{q}' cid={cid[:14]}… → resolved, Yes={price}")
+                    print(f"  ✅ '{q}' cid={cid[:14]}… → resolved, "
+                          f"{probe_outcome}={price}")
                 else:
-                    # Diagnose: lookup problem or parsing problem?
-                    outs, prices = m.get("outcomes"), m.get("outcomePrices")
-                    print(f"  ❌ '{q}' cid={cid[:14]}… not detected")
+                    print(f"  ❌ '{q}' cid={cid[:14]}… [{probe_outcome}] not detected")
                     print(f"     listing says: closed={m.get('closed')} "
-                          f"outcomes={outs} outcomePrices={prices}")
-                    print(f"     → if prices look decisive here, the by-conditionId "
-                          f"REFETCH is the problem, not the parser")
+                          f"outcomes={raw_outs} outcomePrices={m.get('outcomePrices')}")
             report(
                 "resolution detection on live closed markets",
-                tested > 0 and passed_any > 0,
+                tested > 0 and passed_any >= max(1, tested - 1),
                 f"{passed_any}/{tested} detected",
             )
         except Exception as exc:
