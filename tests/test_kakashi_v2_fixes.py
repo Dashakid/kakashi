@@ -301,3 +301,60 @@ class TestConsensusExit:
         }])
         asyncio.run(strat._check_open_positions())
         assert trade_id in strat._tracker._state.open_trades
+
+
+# ============================================================================
+# 6. Gamma mismatch guard (July 2026 live-verification finding)
+# ============================================================================
+
+class TestGammaMismatchGuard:
+    """If Gamma ignores the condition_ids param and returns unrelated markets,
+    the bot must NOT apply a random market's data to our trade."""
+
+    def test_resolution_ignores_wrong_market(self, tmp_path, monkeypatch):
+        strat = _make_strategy(tmp_path, monkeypatch)
+        # Server returns a DIFFERENT (resolved) market than the one requested
+        strat._http = _FakeHttp([{
+            "conditionId": "0xTOTALLY_DIFFERENT",
+            "closed": True,
+            "outcomes": '["Yes", "No"]',
+            "outcomePrices": '["1", "0"]',
+        }])
+        resolved, _ = asyncio.run(strat._check_market_resolved("0xabc", "Yes"))
+        assert resolved is False   # must not close our trade off foreign data
+
+    def test_resolution_empty_market_id_never_queries_generic_list(self, tmp_path, monkeypatch):
+        strat = _make_strategy(tmp_path, monkeypatch)
+        strat._http = _FakeHttp([{
+            "conditionId": "0xrandom",
+            "closed": True,
+            "outcomes": '["Yes", "No"]',
+            "outcomePrices": '["1", "0"]',
+        }])
+        resolved, _ = asyncio.run(strat._check_market_resolved("", "Yes"))
+        assert resolved is False
+
+    def test_snapshot_ignores_wrong_market(self, tmp_path, monkeypatch):
+        strat = _make_strategy(tmp_path, monkeypatch)
+        strat._http = _FakeHttp([{
+            "conditionId": "0xTOTALLY_DIFFERENT",
+            "question": "Wrong market",
+            "outcomes": '["Yes", "No"]',
+            "outcomePrices": '["0.62", "0.38"]',
+            "liquidity": "50000",
+        }])
+        snap = asyncio.run(
+            strat._fetch_market_snapshot("0xabc", "No", 0.40, market_title="")
+        )
+        assert snap is None   # must not price our trade off foreign data
+
+    def test_resolution_picks_matching_market_from_list(self, tmp_path, monkeypatch):
+        strat = _make_strategy(tmp_path, monkeypatch)
+        strat._http = _FakeHttp([
+            {"conditionId": "0xother", "closed": False,
+             "outcomes": '["Yes", "No"]', "outcomePrices": '["0.5", "0.5"]'},
+            {"conditionId": "0xabc", "closed": True,
+             "outcomes": '["Yes", "No"]', "outcomePrices": '["0", "1"]'},
+        ])
+        resolved, price = asyncio.run(strat._check_market_resolved("0xabc", "No"))
+        assert resolved is True and price == 1.0

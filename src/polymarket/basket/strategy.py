@@ -459,7 +459,7 @@ class BasketStrategy:
         Fetch current open positions for one wallet from the data API.
         Returns an empty list on error.
         """
-        url = f"{DATA_API}/positions?user={address}&sizeThreshold=10"
+        url = f"{DATA_API}/positions?user={address}&sizeThreshold=10&limit=500"
         try:
             async with self._http.get(url) as resp:
                 if resp.status != 200:
@@ -629,15 +629,25 @@ class BasketStrategy:
                 fetched_at=time.time(),
             )
 
-        # Try 1: direct condition id lookups
+        # Try 1: direct condition id lookups — verify the returned market is
+        # actually the one we asked for (Gamma returns a generic listing when
+        # a query param is unknown/empty, and pricing a trade off a random
+        # market would be worse than skipping).
+        if not market_id:
+            return None
+        target = market_id.lower()
         for url in (
             f"{GAMMA_API}/markets?condition_ids={market_id}",
             f"{GAMMA_API}/markets?conditionIds={market_id}",
             f"{GAMMA_API}/markets?conditionId={market_id}",
         ):
             markets = await _get_markets(url)
-            if markets:
-                snap = _to_snapshot(markets[0])
+            matched = [
+                m for m in markets
+                if _market_condition_id(m).lower() == target
+            ]
+            if matched:
+                snap = _to_snapshot(matched[0])
                 if snap is not None:
                     self._market_cache[market_id] = snap
                     return snap
@@ -689,6 +699,11 @@ class BasketStrategy:
         outcomes / outcomePrices arrive as JSON-encoded STRINGS and must
         be decoded first.
         """
+        # An empty/None market_id would make the condition_ids param a no-op
+        # and Gamma would return a generic market list — never query with it.
+        if not market_id:
+            return False, 0.0
+
         markets: List[dict] = []
         for url in (
             f"{GAMMA_API}/markets?condition_ids={market_id}",
@@ -703,7 +718,16 @@ class BasketStrategy:
             except Exception:
                 continue
 
-            markets = data if isinstance(data, list) else data.get("data", [])
+            candidates = data if isinstance(data, list) else data.get("data", [])
+            # CRITICAL: verify the returned market is actually OURS. If Gamma
+            # ignores an unknown query param it returns a default listing, and
+            # blindly reading candidates[0] would apply another market's
+            # resolution to our trade.
+            target = market_id.lower()
+            markets = [
+                m for m in candidates
+                if str(m.get("conditionId") or m.get("condition_id") or "").lower() == target
+            ]
             if markets:
                 break
 

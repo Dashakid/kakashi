@@ -77,25 +77,41 @@ async def main() -> int:
         else:
             report("live snapshot parsed", False, "no wallet had open positions to test with")
 
-        # ── 3. Resolution parsing on a real resolved market ────────────
-        print("\n[3] Gamma API — resolution detection on a real closed market")
+        # ── 3. Resolution parsing on real resolved markets ─────────────
+        print("\n[3] Gamma API — resolution detection on real closed markets")
         try:
-            url = f"{GAMMA_API}/markets?closed=true&limit=1&order=volume24hr&ascending=false"
+            url = f"{GAMMA_API}/markets?closed=true&limit=5&order=volume24hr&ascending=false"
             async with http.get(url) as resp:
-                markets = await resp.json()
-            m = (markets if isinstance(markets, list) else markets.get("data", []))[0]
-            cid = m.get("conditionId")
-            outcomes = m.get("outcomes")
-            resolved, price = await strat._check_market_resolved(cid, "Yes")
+                payload = await resp.json()
+            candidates = payload if isinstance(payload, list) else payload.get("data", [])
+            tested = passed_any = 0
+            for m in candidates:
+                cid = str(m.get("conditionId") or "")
+                q = m.get("question", "")[:45]
+                if not cid:
+                    print(f"  ⚠️  '{q}' has EMPTY conditionId — skipped "
+                          f"(bot now guards against this)")
+                    continue
+                tested += 1
+                resolved, price = await strat._check_market_resolved(cid, "Yes")
+                if resolved:
+                    passed_any += 1
+                    print(f"  ✅ '{q}' cid={cid[:14]}… → resolved, Yes={price}")
+                else:
+                    # Diagnose: lookup problem or parsing problem?
+                    outs, prices = m.get("outcomes"), m.get("outcomePrices")
+                    print(f"  ❌ '{q}' cid={cid[:14]}… not detected")
+                    print(f"     listing says: closed={m.get('closed')} "
+                          f"outcomes={outs} outcomePrices={prices}")
+                    print(f"     → if prices look decisive here, the by-conditionId "
+                          f"REFETCH is the problem, not the parser")
             report(
-                "resolved market detected & priced",
-                resolved,
-                f"'{m.get('question','')[:50]}' → Yes side price={price}",
+                "resolution detection on live closed markets",
+                tested > 0 and passed_any > 0,
+                f"{passed_any}/{tested} detected",
             )
-            if not resolved:
-                print(f"     raw outcomes={outcomes} outcomePrices={m.get('outcomePrices')}")
         except Exception as exc:
-            report("resolved market detected & priced", False, str(exc)[:80])
+            report("resolution detection on live closed markets", False, str(exc)[:80])
 
     # ── 4. Tracker state on disk ───────────────────────────────────────
     print("\n[4] Tracker state (data/kakashi_v2_state.json)")
