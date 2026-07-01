@@ -1,0 +1,1 @@
+# Polymarket arbitrage scanner package

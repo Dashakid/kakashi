@@ -1,0 +1,32 @@
+# Environment
+.venv/
+venv/
+*.pyc
+__pycache__/
+.Python
+*.egg-info/
+dist/
+build/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Project specific
+data/
+logs/
+models/
+.env
+.DS_Store
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Notebooks
+.ipynb_checkpoints/
+.kalshi_private_key.pem
